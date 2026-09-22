@@ -5,16 +5,22 @@ import sqlite3
 
 import aiosqlite
 
+# 旧库（documents 尚无 created_at 列之前创建）文档的回填创建时间：
+# 无法还原真实提交时间，统一使用固定基准值，且早于任何真实提交，排序稳定。
+LEGACY_CREATED_AT = "1970-01-01T00:00:00.000000Z"
+
 SCHEMA = """
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
 
 CREATE TABLE IF NOT EXISTS documents (
-    id          TEXT PRIMARY KEY,
-    ciphertext  BLOB NOT NULL,           -- Fernet 加密的原文
-    redacted    TEXT NOT NULL,
-    expires_at  TEXT NOT NULL,           -- ISO-8601 UTC
-    policy_id   TEXT                     -- 提交时引用的自动脱敏策略（可为空）
+    id           TEXT PRIMARY KEY,
+    ciphertext   BLOB NOT NULL,           -- Fernet 加密的原文
+    redacted     TEXT NOT NULL,
+    expires_at   TEXT NOT NULL,           -- ISO-8601 UTC
+    policy_id    TEXT,                    -- 提交时引用的自动脱敏策略（可为空）
+    fingerprint  TEXT,                    -- NFC 规范化原文的 SHA-256；旧数据迁移期可为 NULL，启动回填补齐
+    created_at   TEXT                     -- ISO-8601 UTC，提交时间；旧数据回填为固定基准值
 );
 
 CREATE TABLE IF NOT EXISTS policies (
@@ -58,7 +64,6 @@ CREATE INDEX IF NOT EXISTS idx_fragments_document ON fragments(document_id);
 -- 唯一性只约束保留片段（kept=1）：丢弃片段允许在同一位置重复出现
 CREATE UNIQUE INDEX IF NOT EXISTS idx_fragments_unique
     ON fragments(document_id, placeholder, start_offset) WHERE kept = 1;
-
 CREATE TABLE IF NOT EXISTS restore_tokens (
     token_hash  TEXT PRIMARY KEY,        -- SHA-256(token)
     document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
@@ -100,16 +105,35 @@ _TRACE_INDEX = (
     " ON fragments(document_id, fragment_id)"
 )
 
+# 重复检测迁移：documents 增补指纹列与创建时间列。
+# fingerprint 允许 NULL：旧行迁移后先为 NULL，由应用启动时解密原文回填补齐；
+# created_at 无法还原真实提交时间，统一回填固定基准值（早于任何真实提交，排序稳定）。
+_DOCUMENT_MIGRATIONS = (
+    "ALTER TABLE documents ADD COLUMN fingerprint TEXT",
+    "ALTER TABLE documents ADD COLUMN created_at TEXT NOT NULL"
+    f" DEFAULT '{LEGACY_CREATED_AT}'",
+)
+
+# fingerprint 列就绪后（新库或迁移后）再建索引；同指纹 + 未过期查询走此索引，
+# (created_at, id) 同时充当稳定分页游标
+_FINGERPRINT_INDEX = (
+    "CREATE INDEX IF NOT EXISTS idx_documents_fingerprint_active"
+    " ON documents(fingerprint, created_at, id) WHERE fingerprint IS NOT NULL"
+)
+
 
 async def init_db(db_path: str = ":memory:") -> None:
     """幂等建表 / 迁移（容器启动与 CLI 共用）。
 
     ``:memory:`` 由调用方自己维护单一长连接；此处的短连接只用于文件库初始化。
+    指纹列的旧数据内容回填（需解密原文）在应用启动时执行，见
+    ``DocumentService.backfill_fingerprints``。
     """
     async with aiosqlite.connect(db_path) as db:
         await db.executescript(SCHEMA)
         await _migrate(db)
         await db.execute(_TRACE_INDEX)
+        await db.execute(_FINGERPRINT_INDEX)
         await db.commit()
 
 
@@ -120,6 +144,7 @@ def init_db_sync(db_path: str) -> None:
         conn.executescript(SCHEMA)
         _migrate_sync(conn)
         conn.execute(_TRACE_INDEX)
+        conn.execute(_FINGERPRINT_INDEX)
         conn.commit()
     finally:
         conn.close()
@@ -136,6 +161,13 @@ async def _migrate(db: aiosqlite.Connection) -> None:
     if "fragment_id" not in existing:
         for stmt in _TRACE_MIGRATIONS:
             await db.execute(stmt)
+    doc_cols = {
+        r[1]
+        for r in await db.execute_fetchall("PRAGMA table_info(documents)")
+    }
+    if "fingerprint" not in doc_cols:
+        for stmt in _DOCUMENT_MIGRATIONS:
+            await db.execute(stmt)
 
 
 def _migrate_sync(conn: sqlite3.Connection) -> None:
@@ -145,6 +177,10 @@ def _migrate_sync(conn: sqlite3.Connection) -> None:
             conn.execute(stmt)
     if "fragment_id" not in existing:
         for stmt in _TRACE_MIGRATIONS:
+            conn.execute(stmt)
+    doc_cols = {r[1] for r in conn.execute("PRAGMA table_info(documents)")}
+    if "fingerprint" not in doc_cols:
+        for stmt in _DOCUMENT_MIGRATIONS:
             conn.execute(stmt)
 
 

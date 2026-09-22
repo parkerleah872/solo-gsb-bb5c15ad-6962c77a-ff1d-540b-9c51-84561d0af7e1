@@ -13,6 +13,9 @@ MAX_PATTERN_LEN = 2_000
 MAX_POLICY_RULES = 200
 # 批量恢复单批项数上限：防止超大请求长时间占用写事务
 MAX_BATCH_RESTORE_ITEMS = 20
+# 重复检测单页返回上限
+MAX_DUPLICATE_LIMIT = 100
+DEFAULT_DUPLICATE_LIMIT = 20
 
 
 class SpanIn(BaseModel):
@@ -186,3 +189,34 @@ class PolicyResponse(BaseModel):
     name: str
     created_at: datetime
     rules: list[PolicyRuleOut]
+
+
+# ---------- 重复检测 ----------
+
+
+class DuplicateMatch(BaseModel):
+    document_id: str = Field(..., description="匹配到的其他未过期文档 ID")
+    fingerprint: str = Field(
+        ...,
+        min_length=64,
+        max_length=64,
+        description="NFC 规范化原文的 SHA-256（十六进制），与请求文档指纹相同",
+    )
+    created_at: datetime = Field(..., description="匹配文档的提交时间（UTC）")
+    match_type: Literal["exact_normalized"] = Field(
+        "exact_normalized",
+        description="匹配类型：NFC 规范化后原文完全一致",
+    )
+
+
+class DuplicatesResponse(BaseModel):
+    document_id: str = Field(..., description="被检测的文档 ID")
+    fingerprint: str = Field(
+        ..., min_length=64, max_length=64, description="被检测文档的指纹"
+    )
+    matches: list[DuplicateMatch] = Field(
+        ..., description="其他未过期的重复文档，按创建时间（早 -> 晚）稳定排序"
+    )
+    next_cursor: str | None = Field(
+        None, description="下一页游标（不透明）；无更多结果时为 null"
+    )

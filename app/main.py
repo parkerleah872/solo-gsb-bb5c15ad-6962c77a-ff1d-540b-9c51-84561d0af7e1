@@ -49,6 +49,11 @@ async def lifespan(app: FastAPI):
         rule_timeout=settings.rule_timeout,
         rule_runner=rule_runner,
     )
+    # 旧库迁移后回填重复检测指纹（幂等；需解密原文，失败仅跳过不阻断启动）
+    try:
+        await app.state.service.backfill_fingerprints()
+    except Exception:  # noqa: BLE001 - 回填失败不应阻止服务启动
+        logger.exception("旧文档指纹回填失败，将在访问重复检测接口时懒回填")
 
     stop = asyncio.Event()
 

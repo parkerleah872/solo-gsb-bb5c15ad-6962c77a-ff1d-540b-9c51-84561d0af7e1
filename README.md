@@ -14,6 +14,12 @@
 禁止空匹配，并对**单条规则设置执行超时**，任一规则超时则整次提交 `422` 且不
 写入文档。
 
+还提供**重复文档检测**：服务端解密文档原文、按 **NFC 规范化**后计算
+**SHA-256 指纹**，在 SQLite 中检索其他**未过期**的指纹相同文档；结果只含
+文档 ID、指纹、创建时间与匹配类型 `exact_normalized`，**不返回原文或占位符**，
+并按创建时间稳定键集分页。指纹列与索引随启动迁移自动建立，**旧数据在启动时
+解密回填**（访问接口时还有懒回填兜底）。
+
 ---
 
 ## 一、单命令启动（Docker Compose）
@@ -164,7 +170,53 @@ python -m pytest -q
 `fragment_id` 排序）。
 不返回任何原文信息，不需要令牌。文档过期后返回 `410 Gone`，不存在返回 `404`。
 
-### 5. 一次性令牌恢复 `POST /restore`
+### 5. 重复文档检测 `POST /documents/{document_id}/duplicates`
+
+服务端**解密该文档原文**，先做 **Unicode NFC 规范化**再计算 **SHA-256 指纹**
+（NFC 与 NFD 等不同编码形式的同一文本会得到相同指纹），随后在 SQLite 中查询
+**其他未过期**（`expires_at` 晚于当前时间）且指纹相同的文档。文档不存在
+返回 `404`，已过期返回 `410`（与查询接口一致，同时触发懒删除）。
+
+查询参数：
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `limit` | `20` | 单页数量，`1..100`，非法返回 `422` |
+| `cursor` | 空 | 上一页响应中的 `next_cursor`（不透明 base64url），非法返回 `400` |
+
+```json
+{
+  "document_id": "0b0b3e4b…",
+  "fingerprint": "9f0a…e3（64 位十六进制 SHA-256）",
+  "matches": [
+    {
+      "document_id": "7c21…",
+      "fingerprint": "9f0a…e3",
+      "created_at": "2026-09-21T12:00:00.000000Z",
+      "match_type": "exact_normalized"
+    }
+  ],
+  "next_cursor": "MjAyNi0…（无更多结果时为 null）"
+}
+```
+
+规则：
+
+- 匹配项**只有** `document_id` / `fingerprint` / `created_at` /
+  `match_type` 四个字段；`match_type` 固定为 `exact_normalized`
+  （NFC 规范化后逐码位完全一致）。**绝不返回原文、脱敏文本或占位符**，
+  调用也**不需要恢复令牌**；
+- 结果按 **`created_at` 升序、`id` 升序**决胜，采用 **(created_at, id)
+  键集游标分页**：并发提交导致翻页期间有新文档写入时也不会重复或跳过
+  （严格大于游标位置）；
+- 指纹在**提交时**计算并落库；旧版数据库经启动迁移新增 `fingerprint` /
+  `created_at` 列与部分索引后，由服务在**启动时解密旧文档原文批量回填**
+  （幂等；单行解密失败只告警跳过），接口被调用时还会以实时解密结果做
+  **懒回填**兜底。旧文档真实提交时间无法还原，`created_at` 统一回填为
+  `1970-01-01T00:00:00.000000Z`（排在所有真实文档之前）；
+- 过期文档（含后台清理与懒删除）不参与匹配；被检测文档过期返回 `410`。
+
+### 6. 一次性令牌恢复 `POST /restore`
 
 ```json
 {
@@ -199,7 +251,7 @@ python -m pytest -q
   会返回全部出现位置，并逐一标注 `source` / `rule_id`）；
 - 令牌无效 / 已用 / 过期 → `401`；占位符不属于文档 → `400`；文档已过期 → `410`。
 
-### 6. 批量一次性恢复 `POST /restore/batch`
+### 7. 批量一次性恢复 `POST /restore/batch`
 
 一次请求恢复多份文档的占位符（**1～20 项**），每项各自携带令牌与显式占位符列表：
 
@@ -251,7 +303,7 @@ python -m pytest -q
 - 同一批次内令牌不得重复（一次性令牌不允许被消费两次），重复返回 `400`；
 - 每项的 `placeholders` 规则与单条恢复相同（必填、格式合法、自动去重）。
 
-### 7. 健康检查 `GET /health` → `{"status": "ok"}`
+### 8. 健康检查 `GET /health` → `{"status": "ok"}`
 
 ---
 
@@ -329,6 +381,9 @@ spans: [
 
 - 文档原文、每个保留片段的原文均以 **Fernet（AES-128-CBC + HMAC，cryptography 库）**
   加密后落库；数据库文件中无明文；
+- **重复检测指纹不是明文**：仅保存「NFC 规范化后原文」的 SHA-256 摘要，
+  属不可逆单向哈希；检测接口只暴露 ID / 指纹 / 创建时间 / 匹配类型，
+  不返回原文、脱敏文本、占位符或片段信息；
 - 主密钥通过 `REDACT_MASTER_KEY` 提供（支持 Fernet 密钥，或任意口令经 SHA-256 派生）；
   `REDACT_ENV=production` 时未配置密钥会直接拒绝启动；
 - 文档映射默认 1 天过期（提交时可用 `ttl` 指定，1..604800 秒），
@@ -361,21 +416,24 @@ spans: [
 
 ```
 app/
-  main.py               FastAPI 入口、生命周期、后台清理、异常映射
+  main.py               FastAPI 入口、生命周期、旧文档指纹回填、后台清理、异常映射
   config.py             环境变量配置
   crypto.py             Fernet 加密封装、一次性令牌生成
+  fingerprint.py        重复检测指纹：NFC 规范化 + SHA-256（纯函数，易测）
   db.py                 SQLite 建表（幂等，含旧库迁移）与连接
   redaction.py          重叠消解 / 稳定占位符 / 渲染 / 冲突溯源（纯函数，易测）
   policy_engine.py      规则编译、空匹配拒绝、单规则超时（独立工作进程）
-  schemas.py            请求与响应模型（含策略、片段来源标注、冲突溯源字段）
+  schemas.py            请求与响应模型（含策略、片段来源标注、冲突溯源、重复检测）
   services/
-    document_service.py 提交、查询、恢复、过期清理业务逻辑
+    document_service.py 提交、查询、恢复、重复检测（键集分页）、指纹回填、过期清理
     policy_service.py   自动脱敏策略创建 / 查询（不可变）
     timeutil.py         ISO-8601 UTC 时间工具
     errors.py           服务层错误 -> HTTP 状态码
-  routers/__init__.py    /policies、/documents、/documents/{id}、/restore、/restore/batch、/health
+  routers/__init__.py    /policies、/documents、/documents/{id}、
+                         /documents/{id}/duplicates、/restore、/restore/batch、/health
   cli.py                keygen / initdb 命令
-tests/                  核心算法单元测试 + API 端到端测试（含超时 / 空匹配）
+tests/                  核心算法单元测试 + API 端到端测试（含超时 / 空匹配 /
+                         重复检测分页与旧库迁移回填）
 Dockerfile              非 root 运行、内置健康检查
 docker-compose.yml      单命令启动 + 持久化命名卷
 ```

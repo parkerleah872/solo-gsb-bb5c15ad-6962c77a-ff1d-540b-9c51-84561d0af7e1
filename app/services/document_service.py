@@ -1,13 +1,17 @@
 """文档脱敏、查询、恢复的业务逻辑。"""
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
+import logging
 import uuid
 from datetime import datetime, timedelta
 
 import aiosqlite
 
-from app.crypto import CryptoBox, random_token
+from app.crypto import CryptoBox, InvalidToken, random_token
+from app.fingerprint import fingerprint_text
 from app.policy_engine import ProcessRuleRunner, apply_rules, compile_rules
 from app.redaction import (
     AUTO,
@@ -17,6 +21,8 @@ from app.redaction import (
     validate_category,
 )
 from app.schemas import (
+    DEFAULT_DUPLICATE_LIMIT,
+    MAX_DUPLICATE_LIMIT,
     FragmentOut,
     MAX_SPANS,
     RestoreBatchItem,
@@ -32,6 +38,8 @@ from app.services.errors import (
 )
 from app.services.policy_service import PolicyService
 from app.services.timeutil import from_iso, to_iso, utcnow
+
+logger = logging.getLogger(__name__)
 
 
 def hash_token(token: str) -> str:
@@ -124,6 +132,8 @@ class DocumentService:
 
         doc_id = uuid.uuid4().hex
         now = utcnow()
+        created_iso = to_iso(now)
+        fp = fingerprint_text(req.text)
         doc_expires = now + timedelta(seconds=ttl)
         token = random_token()
         # 令牌有效期不超过文档映射本身
@@ -131,14 +141,18 @@ class DocumentService:
 
         async with self.db.cursor() as cur:
             await cur.execute(
-                "INSERT INTO documents (id, ciphertext, redacted, expires_at, policy_id)"
-                " VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO documents"
+                " (id, ciphertext, redacted, expires_at, policy_id,"
+                " fingerprint, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
                     doc_id,
                     self.crypto.encrypt(req.text),
                     result.redacted_text,
                     to_iso(doc_expires),
                     req.policy_id,
+                    fp,
+                    created_iso,
                 ),
             )
             await cur.executemany(
@@ -213,6 +227,133 @@ class DocumentService:
             "fragments": [self._row_out(r) for r in frags],
             "expires_at": expires,
         }
+
+    # ---------- 重复检测 ----------
+
+    async def find_duplicates(
+        self, document_id: str, limit: int | None = None, cursor: str | None = None
+    ) -> dict:
+        """解密文档原文、按 NFC 规范化计算 SHA-256 指纹，返回其他未过期重复文档。
+
+        指纹以本次解密原文实时计算为准（不信任库内可能尚未回填的值），并顺带
+        把缺失的指纹落库（懒回填，幂等）。结果只含 ID / 指纹 / 创建时间 /
+        匹配类型，绝不返回原文、脱敏文或占位符。分页采用 (created_at, id)
+        键集游标，保证按创建时间稳定排序、翻页不重不漏。
+        """
+        if limit is None:
+            limit = DEFAULT_DUPLICATE_LIMIT
+        if not 1 <= limit <= MAX_DUPLICATE_LIMIT:
+            raise ServiceError(
+                f"limit 必须在 1..{MAX_DUPLICATE_LIMIT} 之间", 422
+            )
+        cur_created, cur_id = self._decode_cursor(cursor)
+
+        async with await self.db.execute(
+            "SELECT id, ciphertext, expires_at, fingerprint, created_at"
+            " FROM documents WHERE id = ?",
+            (document_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        if not row:
+            raise NotFoundError("文档不存在或已过期删除")
+        if from_iso(row["expires_at"]) <= utcnow():
+            await self._delete_document(document_id)
+            await self.db.commit()
+            raise ExpiredError("文档映射已过期")
+
+        fp = fingerprint_text(self.crypto.decrypt(row["ciphertext"]))
+        # 懒回填：旧库迁移后指纹可能为 NULL
+        if row["fingerprint"] is None:
+            await self.db.execute(
+                "UPDATE documents SET fingerprint = ? WHERE id = ?",
+                (fp, document_id),
+            )
+            await self.db.commit()
+
+        now_iso = to_iso(utcnow())
+        # 多取一行判断是否还有下一页；(created_at, id) 与游标做行值比较
+        sql = (
+            "SELECT id, fingerprint, created_at FROM documents"
+            " WHERE fingerprint = ? AND id != ? AND expires_at > ?"
+            " AND (created_at > ? OR (created_at = ? AND id > ?))"
+            " ORDER BY created_at ASC, id ASC LIMIT ?"
+        )
+        params = (fp, document_id, now_iso, cur_created, cur_created, cur_id, limit + 1)
+        async with await self.db.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+
+        has_next = len(rows) > limit
+        page = rows[:limit]
+        next_cursor = None
+        if has_next:
+            next_cursor = self._encode_cursor(page[-1]["created_at"], page[-1]["id"])
+
+        return {
+            "document_id": document_id,
+            "fingerprint": fp,
+            "matches": [
+                {
+                    "document_id": r["id"],
+                    "fingerprint": r["fingerprint"],
+                    "created_at": from_iso(r["created_at"]),
+                    "match_type": "exact_normalized",
+                }
+                for r in page
+            ],
+            "next_cursor": next_cursor,
+        }
+
+    async def backfill_fingerprints(self) -> int:
+        """启动时回填旧库：解密 fingerprint IS NULL 的文档，计算 NFC 指纹落库。
+
+        幂等：只处理仍为 NULL 的行；逐行解密，单行失败（如密钥不匹配）只记录
+        警告并跳过，不阻断启动——该行在被访问重复检测接口时会再次尝试懒回填。
+        返回回填行数。
+        """
+        async with await self.db.execute(
+            "SELECT id, ciphertext FROM documents WHERE fingerprint IS NULL"
+        ) as cur:
+            pending = await cur.fetchall()
+        backfilled = 0
+        for r in pending:
+            try:
+                plaintext = self.crypto.decrypt(r["ciphertext"])
+            except (InvalidToken, ValueError):
+                logger.warning(
+                    "文档 %s 指纹回填失败：原文无法用当前密钥解密，已跳过",
+                    r["id"],
+                )
+                continue
+            await self.db.execute(
+                "UPDATE documents SET fingerprint = ? WHERE id = ? AND fingerprint IS NULL",
+                (fingerprint_text(plaintext), r["id"]),
+            )
+            backfilled += 1
+        if backfilled:
+            await self.db.commit()
+            logger.info("已回填 %d 个旧文档的重复检测指纹", backfilled)
+        return backfilled
+
+    @staticmethod
+    def _encode_cursor(created_at: str, document_id: str) -> str:
+        raw = f"{created_at}|{document_id}".encode("utf-8")
+        return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+    @staticmethod
+    def _decode_cursor(cursor: str | None) -> tuple[str, str]:
+        if cursor is None:
+            # 首页：created_at 取空串（ISO 字符串字典序均大于它），id 取空串
+            return "", ""
+        try:
+            padded = cursor + "=" * (-len(cursor) % 4)
+            raw = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+            created_at, document_id = raw.split("|", 1)
+            from_iso(created_at)  # 校验时间格式
+        except (binascii.Error, ValueError, UnicodeDecodeError) as exc:
+            raise ServiceError("非法分页游标", 400) from exc
+        if len(document_id) != 32:
+            raise ServiceError("非法分页游标", 400)
+        return created_at, document_id
 
     # ---------- 一次性令牌恢复 ----------
 
