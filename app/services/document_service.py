@@ -2,12 +2,20 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import uuid
 from datetime import datetime, timedelta
 
 import aiosqlite
 
+from cryptography.fernet import InvalidToken
+
 from app.crypto import CryptoBox, random_token
+from app.fingerprint import (
+    decode_cursor,
+    encode_cursor,
+    normalized_fingerprint,
+)
 from app.policy_engine import ProcessRuleRunner, apply_rules, compile_rules
 from app.redaction import (
     AUTO,
@@ -18,6 +26,7 @@ from app.redaction import (
 )
 from app.schemas import (
     FragmentOut,
+    MAX_DUPLICATE_LIMIT,
     MAX_SPANS,
     RestoreBatchItem,
     RestoredItem,
@@ -36,6 +45,9 @@ from app.services.timeutil import from_iso, to_iso, utcnow
 
 def hash_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+logger = logging.getLogger("redaction.documents")
 
 
 class DocumentService:
@@ -125,19 +137,23 @@ class DocumentService:
         doc_id = uuid.uuid4().hex
         now = utcnow()
         doc_expires = now + timedelta(seconds=ttl)
+        fingerprint = normalized_fingerprint(req.text)
         token = random_token()
         # 令牌有效期不超过文档映射本身
         token_expires = min(now + timedelta(seconds=self.token_ttl), doc_expires)
 
         async with self.db.cursor() as cur:
             await cur.execute(
-                "INSERT INTO documents (id, ciphertext, redacted, expires_at, policy_id)"
-                " VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO documents (id, ciphertext, redacted, created_at,"
+                " expires_at, fingerprint, policy_id)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
                     doc_id,
                     self.crypto.encrypt(req.text),
                     result.redacted_text,
+                    to_iso(now),
                     to_iso(doc_expires),
+                    fingerprint,
                     req.policy_id,
                 ),
             )
@@ -213,6 +229,129 @@ class DocumentService:
             "fragments": [self._row_out(r) for r in frags],
             "expires_at": expires,
         }
+
+    # ---------- 重复检测 ----------
+
+    async def find_duplicates(
+        self, document_id: str, limit: int, cursor: str | None
+    ) -> dict:
+        """查找其他未过期、NFC 规范化指纹相同的文档（exact_normalized）。
+
+        结果只含文档 ID、指纹、创建时间与匹配类型，绝不返回原文或占位符；
+        按 (created_at, id) 升序做 keyset 分页，翻页顺序稳定。
+        """
+        now = utcnow()
+        now_iso = to_iso(now)
+
+        async with self.db.execute(
+            "SELECT id, ciphertext, fingerprint, expires_at FROM documents WHERE id = ?",
+            (document_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        if not row:
+            raise NotFoundError("文档不存在或已过期删除")
+        if from_iso(row["expires_at"]) <= now:
+            await self._delete_document(document_id)
+            await self.db.commit()
+            raise ExpiredError("文档映射已过期")
+
+        fingerprint = row["fingerprint"]
+        if fingerprint is None:
+            # 旧数据：迁移只补了列，按需解密原文补算，回填后后续查询直接走索引
+            fingerprint = await self._backfill_one(row)
+
+        after_created = after_id = None
+        if cursor is not None:
+            try:
+                after_created, after_id = decode_cursor(cursor)
+            except ValueError as exc:
+                raise ServiceError(str(exc), 400) from exc
+
+        sql = (
+            "SELECT id, fingerprint, created_at FROM documents"
+            " WHERE fingerprint = ? AND expires_at > ? AND id <> ?"
+        )
+        params: list = [fingerprint, now_iso, document_id]
+        if cursor is not None:
+            sql += " AND (created_at > ? OR (created_at = ? AND id > ?))"
+            params.extend([after_created, after_created, after_id])
+        sql += " ORDER BY created_at ASC, id ASC LIMIT ?"
+        params.append(limit + 1)  # 多取一条判断是否还有下一页
+
+        async with self.db.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+
+        has_more = len(rows) > limit
+        page = rows[:limit]
+        next_cursor = None
+        if has_more and page:
+            next_cursor = encode_cursor(page[-1]["created_at"], page[-1]["id"])
+
+        return {
+            "document_id": document_id,
+            "fingerprint": fingerprint,
+            "matches": [
+                {
+                    "document_id": r["id"],
+                    "fingerprint": r["fingerprint"],
+                    "created_at": from_iso(r["created_at"]),
+                    "match_type": "exact_normalized",
+                }
+                for r in page
+            ],
+            "next_cursor": next_cursor,
+        }
+
+    async def _backfill_one(self, row: aiosqlite.Row) -> str:
+        """解密单个旧文档原文补算指纹并落库；密文无法解密时抛 500。"""
+        try:
+            plaintext = self.crypto.decrypt(row["ciphertext"])
+        except InvalidToken as exc:
+            raise ServiceError("文档原文无法解密，指纹回填失败", 500) from exc
+        fingerprint = normalized_fingerprint(plaintext)
+        await self.db.execute(
+            "UPDATE documents SET fingerprint = ? WHERE id = ? AND fingerprint IS NULL",
+            (fingerprint, row["id"]),
+        )
+        await self.db.commit()
+        return fingerprint
+
+    async def backfill_fingerprints(self, batch_size: int = 500) -> int:
+        """启动回填：为旧数据（fingerprint 为 NULL）分批解密原文补算指纹。
+
+        返回本次回填行数。按 id 做 keyset 遍历，每行恰好访问一次：无法解密的行
+        （如主密钥已轮换）跳过并记录日志，不阻断启动；这类文档在被重复检测
+        访问时还会触发一次按需回填。
+        """
+        total = 0
+        last_id = ""
+        while True:
+            async with self.db.execute(
+                "SELECT id, ciphertext FROM documents"
+                " WHERE fingerprint IS NULL AND id > ? ORDER BY id LIMIT ?",
+                (last_id, batch_size),
+            ) as cur:
+                rows = await cur.fetchall()
+            if not rows:
+                break
+            last_id = rows[-1]["id"]
+            for r in rows:
+                try:
+                    plaintext = self.crypto.decrypt(r["ciphertext"])
+                except InvalidToken:
+                    logger.warning("文档 %s 指纹回填跳过：密文无法解密", r["id"])
+                    continue
+                fp = normalized_fingerprint(plaintext)
+                await self.db.execute(
+                    "UPDATE documents SET fingerprint = ?"
+                    " WHERE id = ? AND fingerprint IS NULL",
+                    (fp, r["id"]),
+                )
+                total += 1
+            await self.db.commit()
+        if total:
+            logger.info("旧文档指纹回填完成：%d 行", total)
+        return total
 
     # ---------- 一次性令牌恢复 ----------
 

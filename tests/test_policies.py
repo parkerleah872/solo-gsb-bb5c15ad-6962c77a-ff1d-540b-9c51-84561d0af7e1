@@ -1,6 +1,8 @@
 """自动脱敏策略：创建 / 查询 / 提交合并 / 空匹配与超时的端到端测试。"""
 import sqlite3
 
+from app.main import app
+
 
 TEXT = "甲方张三向乙方李四借款人民币10000元，联系电话13800138000。"
 
@@ -224,8 +226,10 @@ async def test_rule_runtime_empty_match_aborts_submit(client):
 
 
 async def test_rule_timeout_aborts_submit_and_persists_nothing(client, settings):
-    settings.rule_timeout = 0.1
-    # 经典灾难性回溯：22 个 "a" 无 b 可匹配，回溯约 1.6 秒，必然超过 0.1 秒
+    # lifespan 已按 settings 构造服务，运行期需直接调整服务实例的超时阈值，
+    # 否则修改 settings 不会生效（服务在启动时已捕获 rule_timeout）。
+    app.state.service.rule_timeout = 0.1
+    # 经典灾难性回溯：无 b 可匹配时回溯指数级增长，25 个 "a" 约数秒，远超 0.1 秒
     evil = {"rule_id": "evil", "category": "A", "pattern": r"(a+)+b", "priority": 1}
     policy = await _create_policy(client, [evil])
 
@@ -234,14 +238,16 @@ async def test_rule_timeout_aborts_submit_and_persists_nothing(client, settings)
     before = _count_documents(db_path)
     resp = await client.post(
         "/documents",
-        json={"text": "a" * 22, "policy_id": policy["policy_id"]},
+        json={"text": "a" * 25, "policy_id": policy["policy_id"]},
     )
     assert resp.status_code == 422
     assert "超过" in resp.json()["detail"]
     after = _count_documents(db_path)
     assert before == after == 0
 
-    # 超时杀掉工作进程后自动重建：正常策略提交不受影响（服务仍可用）
+    # 超时杀掉工作进程后自动重建：正常策略提交不受影响（服务仍可用）。
+    # 重建走 spawn 冷启动，需恢复正常超时预算。
+    app.state.service.rule_timeout = 1.0
     good = await _create_policy(
         client, [{"rule_id": "ok", "category": "OK", "pattern": "a+", "priority": 1}]
     )

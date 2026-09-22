@@ -13,7 +13,9 @@ CREATE TABLE IF NOT EXISTS documents (
     id          TEXT PRIMARY KEY,
     ciphertext  BLOB NOT NULL,           -- Fernet 加密的原文
     redacted    TEXT NOT NULL,
+    created_at  TEXT NOT NULL,           -- ISO-8601 UTC，重复检测的稳定分页键
     expires_at  TEXT NOT NULL,           -- ISO-8601 UTC
+    fingerprint TEXT,                    -- SHA-256(NFC(原文)) hex；旧数据迁移后按需/启动回填
     policy_id   TEXT                     -- 提交时引用的自动脱敏策略（可为空）
 );
 
@@ -94,10 +96,25 @@ _TRACE_MIGRATIONS = (
     "UPDATE fragments SET decision_rank = fragment_id WHERE decision_rank IS NULL",
 )
 
+# 重复检测迁移：documents 增加创建时间与 NFC 规范化指纹列。
+# created_at 旧行无据可查，以 expires_at 作最佳近似（同批次默认 TTL 的行仍保序）；
+# 指纹需要解密原文，此处只补列与索引，实际回填由服务层启动任务 / 访问时按需完成。
+_DUPLICATE_MIGRATIONS = (
+    "ALTER TABLE documents ADD COLUMN created_at TEXT",
+    "ALTER TABLE documents ADD COLUMN fingerprint TEXT",
+    "UPDATE documents SET created_at = expires_at WHERE created_at IS NULL",
+)
+
 # fragment_id 列就绪后（新库或迁移后）再建唯一索引，保证持久化后编号不漂移
 _TRACE_INDEX = (
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_fragments_fragment_id"
     " ON fragments(document_id, fragment_id)"
+)
+
+
+_FINGERPRINT_INDEX = (
+    "CREATE INDEX IF NOT EXISTS idx_documents_fingerprint"
+    " ON documents(fingerprint, created_at, id)"
 )
 
 
@@ -110,6 +127,7 @@ async def init_db(db_path: str = ":memory:") -> None:
         await db.executescript(SCHEMA)
         await _migrate(db)
         await db.execute(_TRACE_INDEX)
+        await db.execute(_FINGERPRINT_INDEX)
         await db.commit()
 
 
@@ -120,6 +138,7 @@ def init_db_sync(db_path: str) -> None:
         conn.executescript(SCHEMA)
         _migrate_sync(conn)
         conn.execute(_TRACE_INDEX)
+        conn.execute(_FINGERPRINT_INDEX)
         conn.commit()
     finally:
         conn.close()
@@ -136,6 +155,13 @@ async def _migrate(db: aiosqlite.Connection) -> None:
     if "fragment_id" not in existing:
         for stmt in _TRACE_MIGRATIONS:
             await db.execute(stmt)
+    doc_cols = {
+        r[1]
+        for r in await db.execute_fetchall("PRAGMA table_info(documents)")
+    }
+    if "fingerprint" not in doc_cols:
+        for stmt in _DUPLICATE_MIGRATIONS:
+            await db.execute(stmt)
 
 
 def _migrate_sync(conn: sqlite3.Connection) -> None:
@@ -145,6 +171,10 @@ def _migrate_sync(conn: sqlite3.Connection) -> None:
             conn.execute(stmt)
     if "fragment_id" not in existing:
         for stmt in _TRACE_MIGRATIONS:
+            conn.execute(stmt)
+    doc_cols = {r[1] for r in conn.execute("PRAGMA table_info(documents)")}
+    if "fingerprint" not in doc_cols:
+        for stmt in _DUPLICATE_MIGRATIONS:
             conn.execute(stmt)
 
 

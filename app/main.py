@@ -52,6 +52,22 @@ async def lifespan(app: FastAPI):
 
     stop = asyncio.Event()
 
+    # 预热规则执行子进程：spawn 冷启动在高负载下可能超过 REDACT_RULE_TIMEOUT，
+    # 放到启动阶段可避免首个自动脱敏请求被误判超时；预热失败不阻断启动（仍会懒重建）。
+    async def _prewarm() -> None:
+        try:
+            await asyncio.to_thread(rule_runner.run, "a", "a", 30.0)
+        except Exception:  # noqa: BLE001
+            logger.warning("规则执行进程预热失败，将在首次使用时重试", exc_info=True)
+
+    await _prewarm()
+
+    # 旧数据指纹回填（幂等：新库无 fingerprint 为空的行时立即返回）
+    try:
+        await app.state.service.backfill_fingerprints()
+    except Exception:  # noqa: BLE001 - 回填失败不应阻止启动，访问时仍会按需回填
+        logger.exception("旧文档指纹回填失败")
+
     async def cleanup_loop() -> None:
         while not stop.is_set():
             try:

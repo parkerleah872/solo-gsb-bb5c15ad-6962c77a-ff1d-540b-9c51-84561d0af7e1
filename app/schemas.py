@@ -91,6 +91,32 @@ class DocumentResponse(BaseModel):
     expires_at: datetime
 
 
+# ---------- 重复检测 ----------
+
+# 单页最大匹配数
+MAX_DUPLICATE_LIMIT = 200
+
+
+class DuplicateMatch(BaseModel):
+    document_id: str
+    fingerprint: str = Field(..., description="NFC 规范化原文的 SHA-256（64 位十六进制）")
+    created_at: datetime
+    match_type: Literal["exact_normalized"] = Field(
+        ..., description="匹配类型：NFC 规范化后原文完全一致"
+    )
+
+
+class DuplicatesResponse(BaseModel):
+    document_id: str
+    fingerprint: str
+    matches: list[DuplicateMatch] = Field(
+        ..., description="其他未过期且指纹相同的文档，按 (created_at, document_id) 升序"
+    )
+    next_cursor: str | None = Field(
+        None, description="下一页游标（不透明 base64）；无更多结果时为 null"
+    )
+
+
 class RestoreRequest(BaseModel):
     token: str = Field(..., min_length=1, max_length=128)
     placeholders: list[str] = Field(..., min_length=1, max_length=100)

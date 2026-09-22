@@ -1,10 +1,11 @@
 """HTTP 路由。"""
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Query, Request
 
 from app.schemas import (
     DocumentResponse,
+    DuplicatesResponse,
     PolicyCreateRequest,
     PolicyResponse,
     RestoreBatchRequest,
@@ -13,6 +14,7 @@ from app.schemas import (
     RestoreResponse,
     SubmitRequest,
     SubmitResponse,
+    MAX_DUPLICATE_LIMIT,
 )
 from app.services.document_service import DocumentService
 from app.services.policy_service import PolicyService
@@ -71,6 +73,22 @@ async def get_document(
 ) -> dict:
     """查询脱敏文本与片段明细（不含任何原文信息，无需令牌）。"""
     return await service.get(document_id)
+
+
+@router.post("/documents/{document_id}/duplicates", response_model=DuplicatesResponse)
+async def find_duplicates(
+    document_id: str,
+    limit: int = Query(50, ge=1, le=MAX_DUPLICATE_LIMIT, description="单页返回条数上限"),
+    cursor: str | None = Query(None, description="上一页响应中的 next_cursor"),
+    service: DocumentService = Depends(get_service),
+) -> dict:
+    """重复检测：服务端解密该文档原文并按 NFC 规范化计算 SHA-256 指纹，
+    返回其他未过期的同指纹文档（exact_normalized）。
+
+    响应只含匹配文档 ID、指纹、创建时间与匹配类型，不含原文或占位符；
+    结果按 (创建时间, 文档 ID) 稳定升序分页。
+    """
+    return await service.find_duplicates(document_id, limit, cursor)
 
 
 @router.post("/restore", response_model=RestoreResponse)
